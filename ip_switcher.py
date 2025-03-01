@@ -1,5 +1,6 @@
 import sys
 import os
+import time
 from PyQt5.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, \
     QLabel, QFileDialog, QMessageBox, QSizePolicy, QGroupBox, QGraphicsDropShadowEffect, QLineEdit, QProgressBar
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QPoint
@@ -9,16 +10,23 @@ import winreg
 from concurrent.futures import ThreadPoolExecutor
 import logging
 import random
+import ctypes
 
 # 设置日志
 logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(levelname)s - %(message)s", filename="ip_switcher.log")
 
 
 def resource_path(relative_path):
-    """获取打包后文件的绝对路径"""
     if hasattr(sys, '_MEIPASS'):
         return os.path.join(sys._MEIPASS, relative_path)
     return os.path.join(os.path.abspath("."), relative_path)
+
+
+def is_admin():
+    try:
+        return ctypes.windll.shell32.IsUserAnAdmin()
+    except:
+        return False
 
 
 class ProxyTester(QThread):
@@ -28,14 +36,15 @@ class ProxyTester(QThread):
     def __init__(self, proxies, max_workers):
         super().__init__()
         self.proxies = proxies
-        self.max_workers = max_workers  # 接收自定义线程数
+        self.max_workers = max_workers
 
     def run(self):
         def test_proxy(proxy):
             try:
                 proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
-                response = requests.get("http://ipinfo.io/ip", proxies=proxies, timeout=2)
-                return proxy, response.status_code == 200, response.text.strip()
+                response = requests.get("http://edge-http.microsoft.com/captiveportal/generate_204", proxies=proxies,
+                                        timeout=2)
+                return proxy, response.status_code == 204, response.status_code
             except requests.exceptions.ConnectionError:
                 logging.error(f"代理 {proxy} 连接失败")
                 return proxy, False, "连接失败"
@@ -53,7 +62,6 @@ class ProxyTester(QThread):
         total = len(self.proxies)
         completed = 0
 
-        # 使用用户指定的线程数
         with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             future_to_proxy = {executor.submit(test_proxy, proxy): proxy for proxy in self.proxies}
             for future in future_to_proxy:
@@ -66,12 +74,57 @@ class ProxyTester(QThread):
         self.result_ready.emit(results)
 
 
+class ProxySwitcher(QThread):
+    switch_completed = pyqtSignal(str, str)  # 新 IP 和代理
+    switch_failed = pyqtSignal(str)  # 错误信息
+
+    def __init__(self, proxy):
+        super().__init__()
+        self.proxy = proxy
+
+    def run(self):
+        try:
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                                 0, winreg.KEY_ALL_ACCESS)
+            proxy_ip, proxy_port = self.proxy.split(":")
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+            winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{proxy_ip}:{proxy_port}")
+            winreg.CloseKey(key)
+            logging.info(f"设置系统代理成功: {self.proxy}")
+
+            # 等待代理生效
+            time.sleep(1)
+            # 使用系统代理测试，proxies=None 依赖系统设置
+            response = requests.get("http://edge-http.microsoft.com/captiveportal/generate_204", proxies=None,
+                                    timeout=3)
+            if response.status_code != 204:
+                raise Exception(f"代理未生效，状态码: {response.status_code}")
+            # 获取实际 IP
+            ip_response = requests.get("http://ipinfo.io/ip", proxies=None, timeout=3)
+            new_ip = ip_response.text.strip()
+            self.switch_completed.emit(new_ip, self.proxy)
+        except PermissionError:
+            self.switch_failed.emit("权限不足，请以管理员身份运行程序")
+        except ValueError as e:
+            self.switch_failed.emit(f"代理格式错误: {str(e)}")
+        except (
+        requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as e:
+            self.switch_failed.emit(f"网络错误: {str(e)}")
+        except Exception as e:
+            self.switch_failed.emit(f"设置代理失败: {str(e)}")
+
+
 class IPSwitcher(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("IP自动更换工具")
         self.setGeometry(100, 100, 1080, 720)
         self.setMinimumSize(400, 500)
+
+        # 检查管理员权限
+        if not is_admin():
+            QMessageBox.warning(self, "警告", "请以管理员身份运行程序以确保系统代理生效")
 
         # 设置无边框和透明背景
         self.setWindowFlags(Qt.FramelessWindowHint)
@@ -280,10 +333,9 @@ class IPSwitcher(QMainWindow):
             }
         """)
 
-        # 添加线程数输入框
         self.thread_label = QLabel("测试线程数：")
         self.thread_label.setStyleSheet("color: #333;")
-        self.thread_input = QLineEdit("10")  # 默认 10 个线程
+        self.thread_input = QLineEdit("10")
         self.thread_input.setFixedWidth(60)
         self.thread_input.setStyleSheet("""
             QLineEdit {
@@ -358,34 +410,6 @@ class IPSwitcher(QMainWindow):
 
         # 自动加载 proxies.txt
         self.load_default_proxies()
-
-    def set_system_proxy(self, proxy):
-        try:
-            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                                 r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-                                 0, winreg.KEY_ALL_ACCESS)
-            if proxy:
-                proxy_ip, proxy_port = proxy.split(":")
-                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
-                winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{proxy_ip}:{proxy_port}")
-                logging.info(f"设置系统代理成功: {proxy}")
-            else:
-                winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-                logging.info("已关闭系统代理")
-            winreg.CloseKey(key)
-            return True
-        except PermissionError:
-            logging.error("权限不足，无法设置系统代理，请以管理员身份运行")
-            QMessageBox.critical(self, "错误", "权限不足，请以管理员身份运行程序")
-            return False
-        except ValueError as e:
-            logging.error(f"代理格式错误: {str(e)}")
-            QMessageBox.critical(self, "错误", f"代理格式错误: {str(e)}")
-            return False
-        except Exception as e:
-            logging.error(f"设置系统代理失败: {str(e)}")
-            QMessageBox.critical(self, "错误", f"设置系统代理失败: {str(e)}")
-            return False
 
     def load_default_proxies(self):
         txt_path = resource_path("proxies.txt")
@@ -471,9 +495,17 @@ class IPSwitcher(QMainWindow):
         self.valid_proxies = []
         self.proxy_list.clear()
         for proxy, is_valid, ip_or_error in results:
-            if is_valid and isinstance(ip_or_error, str) and ip_or_error:
-                self.valid_proxies.append((proxy, ip_or_error))
-                self.proxy_list.addItem(f"{proxy} - 可用 (IP: {ip_or_error})")
+            if is_valid:
+                # 获取 IP 地址
+                try:
+                    proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+                    ip_response = requests.get("http://ipinfo.io/ip", proxies=proxies, timeout=2)
+                    ip = ip_response.text.strip()
+                    self.valid_proxies.append((proxy, ip))
+                    self.proxy_list.addItem(f"{proxy} - 可用 (IP: {ip})")
+                except Exception as e:
+                    logging.error(f"获取代理 {proxy} 的 IP 失败: {str(e)}")
+                    self.proxy_list.addItem(f"{proxy} - 可用 (IP: 未知)")
 
         self.test_button.setEnabled(True)
         self.progress_bar.setVisible(False)
@@ -482,35 +514,46 @@ class IPSwitcher(QMainWindow):
             self.switch_ip(self.valid_proxies[0][0])
 
     def switch_ip(self, proxy):
-        try:
-            self.current_proxy = proxy
-            if not self.set_system_proxy(proxy):
-                raise Exception("设置系统代理失败")
-            response = requests.get("http://ipinfo.io/ip", timeout=5)
-            new_ip = response.text.strip()
+        self.test_result_label.setText(f"正在切换到代理：{proxy}")
+        self.load_button.setEnabled(False)
+        self.test_button.setEnabled(False)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(False)
 
-            self.ip_animation.setStartValue(1.0)
-            self.ip_animation.setEndValue(0.0)
-            self.ip_animation.start()
-            self.ip_animation.finished.connect(lambda: self.update_ip_label(new_ip, proxy))
+        self.switcher = ProxySwitcher(proxy)
+        self.switcher.switch_completed.connect(self.on_switch_completed)
+        self.switcher.switch_failed.connect(self.on_switch_failed)
+        self.switcher.start()
 
-            logging.info(f"IP切换成功，新IP: {new_ip}, 代理: {proxy}")
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException,
-                Exception) as e:
-            logging.error(f"代理 {proxy} 失败: {str(e)}")
-            self.test_result_label.setText(f"代理 {proxy} 失败: {str(e)}，跳过")
-            self.valid_proxies = [(p, ip) for p, ip in self.valid_proxies if p != proxy]
-            self.proxy_list.clear()
-            for p, ip in self.valid_proxies:
-                self.proxy_list.addItem(f"{p} - 可用 (IP: {ip})")
-            if self.valid_proxies:
-                next_proxy = random.choice(self.valid_proxies)[0]
-                logging.info(f"跳到下一个代理: {next_proxy}")
-                self.switch_ip(next_proxy)
-            else:
-                self.current_ip_label.setText("当前IP：无可用代理")
-                self.test_result_label.setText("所有代理不可用")
-                self.set_system_proxy(None)
+    def on_switch_completed(self, new_ip, proxy):
+        self.current_proxy = proxy
+        self.ip_animation.setStartValue(1.0)
+        self.ip_animation.setEndValue(0.0)
+        self.ip_animation.start()
+        self.ip_animation.finished.connect(lambda: self.update_ip_label(new_ip, proxy))
+        self.load_button.setEnabled(True)
+        self.test_button.setEnabled(True)
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(self.auto_running)
+
+    def on_switch_failed(self, error):
+        logging.error(f"代理切换失败: {error}")
+        self.test_result_label.setText(f"切换失败: {error}，跳过")
+        self.valid_proxies = [(p, ip) for p, ip in self.valid_proxies if p != self.current_proxy]
+        self.proxy_list.clear()
+        for p, ip in self.valid_proxies:
+            self.proxy_list.addItem(f"{p} - 可用 (IP: {ip})")
+        if self.valid_proxies:
+            next_proxy = random.choice(self.valid_proxies)[0]
+            logging.info(f"跳到下一个代理: {next_proxy}")
+            self.switch_ip(next_proxy)
+        else:
+            self.current_ip_label.setText("当前IP：无可用代理")
+            self.test_result_label.setText("所有代理不可用")
+            self.load_button.setEnabled(True)
+            self.test_button.setEnabled(True)
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(self.auto_running)
 
     def update_ip_label(self, new_ip, proxy):
         self.current_ip_label.setText(f"当前IP：{new_ip}")
@@ -534,11 +577,8 @@ class IPSwitcher(QMainWindow):
         attempts = 0
         while self.valid_proxies and attempts < max_attempts:
             new_proxy = random.choice(self.valid_proxies)[0]
-            try:
-                self.switch_ip(new_proxy)
-                return
-            except Exception:
-                attempts += 1
+            self.switch_ip(new_proxy)
+            return  # 子线程执行，退出循环等待结果
         if not self.valid_proxies:
             QMessageBox.warning(self, "警告", "所有代理不可用，自动切换已停止")
             self.stop_auto_switch()
@@ -574,7 +614,11 @@ class IPSwitcher(QMainWindow):
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.start_button.setText("开始自动更换IP")
-            self.set_system_proxy(None)
+            key = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                                 r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                                 0, winreg.KEY_ALL_ACCESS)
+            winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+            winreg.CloseKey(key)
             self.current_ip_label.setText("当前IP：无")
             self.test_result_label.setText("测试结果：未测试")
             QMessageBox.information(self, "停止", "已停止自动更换IP，系统代理已关闭")
